@@ -60,13 +60,13 @@ contract FeeOnTransferMockToken is MockToken {
 }
 
 contract FalseReturningMockToken is MockToken {
-  function transferFrom(address, address, uint256) external pure override returns (bool) {
+  function transferFrom(address, address, uint256) external override returns (bool) {
     return false;
   }
 }
 
 contract RevertingMockToken is MockToken {
-  function transferFrom(address, address, uint256) external pure override returns (bool) {
+  function transferFrom(address, address, uint256) external override returns (bool) {
     revert("MOCK_REVERT");
   }
 }
