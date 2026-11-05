@@ -23,7 +23,7 @@ contract MockToken {
     return true;
   }
 
-  function transfer(address to, uint256 amount) external returns (bool) {
+  function transfer(address to, uint256 amount) external virtual returns (bool) {
     require(balanceOf[msg.sender] >= amount, "ERC20: balance");
     balanceOf[msg.sender] -= amount;
     balanceOf[to] += amount;
@@ -39,6 +39,37 @@ contract MockToken {
     balanceOf[from] -= amount;
     balanceOf[to] += amount;
     return true;
+  }
+}
+
+contract NoDataMockToken is MockToken {
+  // Returns empty bytes on transfer/transferFrom (like USDT)
+  function transfer(address to, uint256 amount) external override returns (bool) {
+    require(balanceOf[msg.sender] >= amount, "ERC20: balance");
+    balanceOf[msg.sender] -= amount;
+    balanceOf[to] += amount;
+    assembly {
+      return(0, 0)
+    }
+  }
+
+  function transferFrom(address from, address to, uint256 amount) external override returns (bool) {
+    uint256 currentAllowance = allowance[from][msg.sender];
+    require(currentAllowance >= amount, "ERC20: allowance");
+    require(balanceOf[from] >= amount, "ERC20: balance");
+
+    allowance[from][msg.sender] = currentAllowance - amount;
+    balanceOf[from] -= amount;
+    balanceOf[to] += amount;
+    assembly {
+      return(0, 0)
+    }
+  }
+}
+
+contract FalseTransferMockToken is MockToken {
+  function transfer(address, uint256) external override returns (bool) {
+    return false;
   }
 }
 
@@ -469,5 +500,221 @@ contract PawnTest is Test {
     // latest view pagination
     (uint256[] memory ids, ) = pawn.latest(0, 10);
     assertEq(ids.length, 1);
+  }
+
+  // --- Feedback Round 1 Pinning Tests ---
+
+  function test_PageFromMiddleReturnsExactIdsNewestFirst() public {
+    // Create 6 loans from lender
+    address b1 = makeAddr("borrower1");
+    token.mint(b1, COLLATERAL * 10);
+
+    for (uint256 i = 0; i < 6; i++) {
+      vm.prank(lender);
+      pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+    }
+    // Loan IDs are 1..6
+
+    // Take loans 2, 4, 6 by borrower1
+    vm.startPrank(b1);
+    token.approve(address(pawn), type(uint256).max);
+    pawn.take(2);
+    pawn.take(4);
+    pawn.take(6);
+    vm.stopPrank();
+
+    // 1. latest view: 6 total loans (1,2,3,4,5,6)
+    // offset = 0, count = 2 -> [6, 5]
+    (uint256[] memory idsLatest0, ) = pawn.latest(0, 2);
+    assertEq(idsLatest0.length, 2);
+    assertEq(idsLatest0[0], 6);
+    assertEq(idsLatest0[1], 5);
+
+    // offset = 2, count = 2 -> [4, 3]
+    (uint256[] memory idsLatest2, ) = pawn.latest(2, 2);
+    assertEq(idsLatest2.length, 2);
+    assertEq(idsLatest2[0], 4);
+    assertEq(idsLatest2[1], 3);
+
+    // 2. byLender view: all 6 created by lender
+    // offset = 0, count = 2 -> [6, 5]
+    (uint256[] memory idsLender0, ) = pawn.byLender(lender, 0, 2);
+    assertEq(idsLender0.length, 2);
+    assertEq(idsLender0[0], 6);
+    assertEq(idsLender0[1], 5);
+
+    // offset = 2, count = 2 -> [4, 3]
+    (uint256[] memory idsLender2, ) = pawn.byLender(lender, 2, 2);
+    assertEq(idsLender2.length, 2);
+    assertEq(idsLender2[0], 4);
+    assertEq(idsLender2[1], 3);
+
+    // 3. byBorrower view: loans taken are [2, 4, 6]
+    // offset = 0, count = 2 -> [6, 4]
+    (uint256[] memory idsBorrower0, ) = pawn.byBorrower(b1, 0, 2);
+    assertEq(idsBorrower0.length, 2);
+    assertEq(idsBorrower0[0], 6);
+    assertEq(idsBorrower0[1], 4);
+
+    // offset = 1, count = 2 -> [4, 2]
+    (uint256[] memory idsBorrower1, ) = pawn.byBorrower(b1, 1, 2);
+    assertEq(idsBorrower1.length, 2);
+    assertEq(idsBorrower1[0], 4);
+    assertEq(idsBorrower1[1], 2);
+  }
+
+  function test_EmptyPageViews() public {
+    // count == 0
+    (uint256[] memory ids1, ) = pawn.latest(0, 0);
+    assertEq(ids1.length, 0);
+
+    // offset >= total
+    (uint256[] memory ids2, ) = pawn.latest(10, 5);
+    assertEq(ids2.length, 0);
+
+    (uint256[] memory ids3, ) = pawn.byLender(lender, 0, 0);
+    assertEq(ids3.length, 0);
+
+    (uint256[] memory ids4, ) = pawn.byLender(lender, 10, 5);
+    assertEq(ids4.length, 0);
+
+    (uint256[] memory ids5, ) = pawn.byBorrower(borrower, 0, 0);
+    assertEq(ids5.length, 0);
+
+    (uint256[] memory ids6, ) = pawn.byBorrower(borrower, 10, 5);
+    assertEq(ids6.length, 0);
+  }
+
+  function test_LenderCancelBeforeAndAfterExpiryCombinations() public {
+    // 4 combinations of (isLender, isExpired):
+    // 1. lender + not expired: succeeds via direct push
+    vm.prank(lender);
+    uint256 id1 = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+    uint256 lenderBalBefore = lender.balance;
+    vm.prank(lender);
+    pawn.cancel(id1);
+    assertEq(lender.balance, lenderBalBefore + PRINCIPAL);
+    assertEq(pawn.pending(lender), 0);
+
+    // 2. non-lender + not expired: reverts NotLender
+    vm.prank(lender);
+    uint256 id2 = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+    vm.prank(borrower);
+    vm.expectRevert(Pawn.NotLender.selector);
+    pawn.cancel(id2);
+
+    // 3. lender + expired: succeeds via pending credit
+    vm.warp(block.timestamp + OFFER_SECS + 1);
+    uint256 lenderPendingBefore = pawn.pending(lender);
+    vm.prank(lender);
+    pawn.cancel(id2);
+    assertEq(pawn.pending(lender), lenderPendingBefore + PRINCIPAL);
+
+    // 4. non-lender + expired: succeeds via pending credit to lender
+    vm.prank(lender);
+    uint256 id3 = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+    vm.warp(block.timestamp + OFFER_SECS + 1);
+    uint256 lenderPendingBefore2 = pawn.pending(lender);
+    vm.prank(borrower);
+    pawn.cancel(id3);
+    assertEq(pawn.pending(lender), lenderPendingBefore2 + PRINCIPAL);
+  }
+
+  function test_ExactBoundaryValuesAndTimestamps() public {
+    // termSecs == MIN_TERM accepted, MIN_TERM - 1 rejected
+    uint64 minTerm = pawn.MIN_TERM();
+    uint64 maxOffer = pawn.MAX_OFFER();
+
+    vm.prank(lender);
+    uint256 idMinTerm = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, minTerm, OFFER_SECS);
+    assertTrue(idMinTerm > 0);
+
+    vm.prank(lender);
+    vm.expectRevert(Pawn.BadTimes.selector);
+    pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, minTerm - 1, OFFER_SECS);
+
+    // offerSecs == MAX_OFFER accepted, MAX_OFFER + 1 rejected
+    vm.prank(lender);
+    uint256 idMaxOffer = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, maxOffer);
+    assertTrue(idMaxOffer > 0);
+
+    vm.prank(lender);
+    vm.expectRevert(Pawn.BadTimes.selector);
+    pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, maxOffer + 1);
+
+    // take at block.timestamp == offerEnds succeeds, offerEnds + 1 reverts
+    vm.prank(lender);
+    uint256 idTake = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+    Pawn.Loan memory ln = pawn.loanOf(idTake);
+
+    token.mint(borrower, COLLATERAL * 2);
+    vm.prank(borrower);
+    token.approve(address(pawn), COLLATERAL * 2);
+
+    // Warp exactly to offerEnds
+    vm.warp(ln.offerEnds);
+    vm.prank(borrower);
+    pawn.take(idTake); // Must succeed!
+
+    // Another loan to test offerEnds + 1
+    vm.prank(lender);
+    uint256 idTakeLate = pawn.offer{value: PRINCIPAL}(address(token), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+    Pawn.Loan memory lnLate = pawn.loanOf(idTakeLate);
+
+    vm.warp(lnLate.offerEnds + 1);
+    vm.prank(borrower);
+    vm.expectRevert(Pawn.OfferEnded.selector);
+    pawn.take(idTakeLate);
+  }
+
+  function test_TokenReturningFalseAndNoData() public {
+    // 1. False returning token on take (deposit) reverts TokenTransferFailed
+    FalseReturningMockToken falseTok = new FalseReturningMockToken();
+    falseTok.mint(borrower, COLLATERAL);
+
+    vm.prank(lender);
+    uint256 idFalse = pawn.offer{value: PRINCIPAL}(address(falseTok), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+
+    vm.startPrank(borrower);
+    falseTok.approve(address(pawn), COLLATERAL);
+    vm.expectRevert(Pawn.TokenTransferFailed.selector);
+    pawn.take(idFalse);
+    vm.stopPrank();
+
+    // 2. No-data returning token on take (deposit) succeeds
+    NoDataMockToken noDataTok = new NoDataMockToken();
+    noDataTok.mint(borrower, COLLATERAL);
+
+    vm.prank(lender);
+    uint256 idNoData = pawn.offer{value: PRINCIPAL}(address(noDataTok), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+
+    vm.startPrank(borrower);
+    noDataTok.approve(address(pawn), COLLATERAL);
+    pawn.take(idNoData); // succeeds!
+    vm.stopPrank();
+
+    // 3. No-data returning token on repay (payout) succeeds
+    vm.deal(borrower, PRINCIPAL + INTEREST);
+    vm.prank(borrower);
+    pawn.repay{value: PRINCIPAL + INTEREST}(idNoData);
+    assertEq(noDataTok.balanceOf(borrower), COLLATERAL);
+
+    // 4. False returning token on repay (payout) reverts TokenTransferFailed
+    // Create loan with regular token, swap token in state or use FalseTransferMockToken
+    FalseTransferMockToken falsePayoutTok = new FalseTransferMockToken();
+    falsePayoutTok.mint(borrower, COLLATERAL);
+
+    vm.prank(lender);
+    uint256 idFalsePayout = pawn.offer{value: PRINCIPAL}(address(falsePayoutTok), COLLATERAL, INTEREST, TERM, OFFER_SECS);
+
+    vm.startPrank(borrower);
+    falsePayoutTok.approve(address(pawn), COLLATERAL);
+    pawn.take(idFalsePayout); // transferFrom succeeds
+    vm.stopPrank();
+
+    vm.deal(borrower, PRINCIPAL + INTEREST);
+    vm.prank(borrower);
+    vm.expectRevert(Pawn.TokenTransferFailed.selector);
+    pawn.repay{value: PRINCIPAL + INTEREST}(idFalsePayout);
   }
 }
